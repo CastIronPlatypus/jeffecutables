@@ -2,9 +2,9 @@
 set -euo pipefail
 
 FLYWHEEL_VERSION="0.3.0"
-NTM_BIN="${HOME}/.local/bin/ntm"
-BR_BIN="${HOME}/.local/bin/br"
-CLAUDE_BIN="${HOME}/.local/bin/claude"
+NTM_BIN="${NTM_BIN:-}"
+BR_BIN="${BR_BIN:-}"
+CLAUDE_BIN="${CLAUDE_BIN:-}"
 DEV_DIR="${HOME}/dev"
 PROJECTS_BASE=""
 
@@ -17,13 +17,61 @@ C_DIM="#6c7086"
 C_WARN="#f9e2af"
 
 # --- Setup ---
+resolve_bin() {
+    local name="$1"
+    local preferred="${2:-}"
+    local fallback="${HOME}/.local/bin/${name}"
+
+    if [[ -n "$preferred" && -x "$preferred" ]]; then
+        echo "$preferred"
+        return 0
+    fi
+
+    if command -v "$name" &>/dev/null; then
+        command -v "$name"
+        return 0
+    fi
+
+    if [[ -x "$fallback" ]]; then
+        echo "$fallback"
+        return 0
+    fi
+
+    return 1
+}
+
+setup_bins() {
+    NTM_BIN="$(resolve_bin ntm "$NTM_BIN")" || NTM_BIN="${HOME}/.local/bin/ntm"
+    BR_BIN="$(resolve_bin br "$BR_BIN")" || BR_BIN="${HOME}/.local/bin/br"
+    CLAUDE_BIN="$(resolve_bin claude "$CLAUDE_BIN")" || CLAUDE_BIN="${HOME}/.local/bin/claude"
+}
+
 get_projects_base() {
-    PROJECTS_BASE="$("$NTM_BIN" config get projects_base 2>/dev/null || echo "${HOME}/ntm_Dev")"
+    local candidate=""
+
+    candidate="$("$NTM_BIN" config get projects_base 2>/dev/null || true)"
+    candidate="${candidate//$'\r'/}"
+    candidate="$(printf '%s' "$candidate" | head -n 1)"
+
+    if [[ -n "$candidate" && -d "$candidate" ]]; then
+        PROJECTS_BASE="$candidate"
+        return 0
+    fi
+
+    if [[ -d "${HOME}/ntm_Dev" ]]; then
+        PROJECTS_BASE="${HOME}/ntm_Dev"
+        return 0
+    fi
+
+    PROJECTS_BASE="/data/projects"
 }
 
 check_deps() {
     local missing=()
-    for cmd in ntm br claude gh gum jq; do
+    [[ -x "$NTM_BIN" ]] || missing+=("ntm")
+    [[ -x "$BR_BIN" ]] || missing+=("br")
+    [[ -x "$CLAUDE_BIN" ]] || missing+=("claude")
+    for cmd in gh gum jq; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
@@ -800,6 +848,7 @@ mode_status() {
 # ============================================================================
 
 main() {
+    setup_bins
     check_deps
     get_projects_base
 
