@@ -1,0 +1,855 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FLYWHEEL_VERSION="0.3.0"
+NTM_BIN="${HOME}/.local/bin/ntm"
+BR_BIN="${HOME}/.local/bin/br"
+CLAUDE_BIN="${HOME}/.local/bin/claude"
+DEV_DIR="${HOME}/dev"
+PROJECTS_BASE=""
+
+# --- Colors (Catppuccin Mocha) ---
+C_PRIMARY="#89b4fa"
+C_SUCCESS="#a6e3a1"
+C_ERROR="#f38ba8"
+C_ACCENT="#cba6f7"
+C_DIM="#6c7086"
+C_WARN="#f9e2af"
+
+# --- Setup ---
+get_projects_base() {
+    PROJECTS_BASE="$("$NTM_BIN" config get projects_base 2>/dev/null || echo "${HOME}/ntm_Dev")"
+}
+
+check_deps() {
+    local missing=()
+    for cmd in ntm br claude gh gum jq; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        err "Missing dependencies: ${missing[*]}"
+        echo "Run: acfs doctor"
+        exit 1
+    fi
+}
+
+# --- UI Helpers ---
+banner() {
+    gum style --border double --border-foreground "$C_PRIMARY" \
+        --padding "0 2" --align center --bold \
+        "FLYWHEEL v${FLYWHEEL_VERSION}" "Swarm Coding Wizard"
+    echo
+}
+
+msg() { gum style --foreground "$C_PRIMARY" "$*"; }
+ok() { gum style --foreground "$C_SUCCESS" --bold "✓ $*"; }
+err() { gum style --foreground "$C_ERROR" --bold "✗ $*" >&2; }
+dim() { gum style --foreground "$C_DIM" "$*"; }
+warn() { gum style --foreground "$C_WARN" "⚠ $*"; }
+step_header() { gum style --foreground "$C_ACCENT" --bold "── $* ──"; echo; }
+
+choose() {
+    local header="$1"; shift
+    gum choose --header "$header" --header.foreground "$C_ACCENT" "$@"
+}
+
+input() {
+    local header="$1"; shift
+    gum input --header "$header" --header.foreground "$C_ACCENT" \
+        --cursor.foreground "$C_PRIMARY" "$@"
+}
+
+confirm() { gum confirm --affirmative "Yes" --negative "No" "$@"; }
+
+spin() {
+    local title="$1"; shift
+    gum spin --spinner dot --title "$title" --spinner.foreground "$C_PRIMARY" -- "$@"
+}
+
+filter() {
+    local header="$1"; shift
+    gum filter --header "$header" --header.foreground "$C_ACCENT" \
+        --indicator.foreground "$C_PRIMARY" "$@"
+}
+
+slugify() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | \
+        sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//' | cut -c1-50
+}
+
+pick_project() {
+    local dirs
+    dirs="$(ls -1 "$PROJECTS_BASE" 2>/dev/null)" || true
+    if [[ -z "$dirs" ]]; then
+        err "No projects found in $PROJECTS_BASE"
+        return 1
+    fi
+    echo "$dirs" | filter "Pick a project"
+}
+
+# --- Claude wrapper with auth retry ---
+# Streams Claude's output live to the terminal so user sees progress.
+# Result is saved to $CLAUDE_RESULT_FILE for the caller to read.
+CLAUDE_RESULT_FILE=""
+
+claude_ask() {
+    local proj_dir="$1"
+    local prompt="$2"
+    local attempt
+    local prompt_file
+    prompt_file="$(mktemp /tmp/flywheel-prompt-XXXXXX.txt)"
+    CLAUDE_RESULT_FILE="$(mktemp /tmp/flywheel-result-XXXXXX.txt)"
+    printf '%s' "$prompt" > "$prompt_file"
+
+    dim "─────────────────────────────────────"
+
+    for attempt in 1 2; do
+        # Stream to terminal via tee, capture to file
+        (cd "$proj_dir" && "$CLAUDE_BIN" -p \
+            --output-format text \
+            "$(cat "$prompt_file")" < /dev/null 2>/dev/null) \
+            | tee "$CLAUDE_RESULT_FILE"
+
+        local result
+        result="$(cat "$CLAUDE_RESULT_FILE")"
+
+        if echo "$result" | grep -q "authentication_error\|token has expired"; then
+            if [[ $attempt -eq 1 ]]; then
+                warn "Auth token issue, retrying..."
+                sleep 2
+                continue
+            else
+                err "Claude auth token expired"
+                dim "Run 'claude' interactively to refresh, then retry."
+                rm -f "$prompt_file"
+                return 1
+            fi
+        fi
+
+        if [[ -z "$result" ]]; then
+            if [[ $attempt -eq 1 ]]; then
+                warn "Empty response, retrying..."
+                sleep 2
+                continue
+            else
+                err "Empty response from Claude"
+                rm -f "$prompt_file"
+                return 1
+            fi
+        fi
+
+        echo
+        dim "─────────────────────────────────────"
+        rm -f "$prompt_file"
+        return 0
+    done
+    rm -f "$prompt_file"
+    return 1
+}
+
+# Read the last claude_ask result
+claude_result() {
+    cat "$CLAUDE_RESULT_FILE" 2>/dev/null
+}
+
+# --- Mode: New Project ---
+mode_new_project() {
+    msg "Create a new flywheel project"
+    echo
+
+    local name
+    name="$(input "Project name" --placeholder "my-awesome-project")"
+    name="$(echo "$name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g; s/--*/-/g; s/^-//; s/-$//')"
+
+    if [[ -z "$name" ]]; then
+        err "Project name cannot be empty"
+        return 1
+    fi
+
+    if [[ -d "${PROJECTS_BASE}/${name}" ]]; then
+        err "Project '${name}' already exists at ${PROJECTS_BASE}/${name}"
+        return 1
+    fi
+
+    local source
+    source="$(choose "Source code" \
+        "Local folder (~/dev/)" \
+        "GitHub repo" \
+        "Start fresh")"
+
+    # Create the project
+    msg "Creating project structure..."
+    "$NTM_BIN" new "$name" 2>&1 | tail -5
+    echo
+
+    local proj_dir="${PROJECTS_BASE}/${name}"
+
+    case "$source" in
+        "Local folder"*)
+            local folders
+            folders="$(ls -1 "$DEV_DIR" 2>/dev/null)" || true
+            if [[ -z "$folders" ]]; then
+                err "No folders found in $DEV_DIR"
+                return 1
+            fi
+            local src
+            src="$(echo "$folders" | filter "Pick source folder")"
+            local src_path="${DEV_DIR}/${src}"
+
+            if confirm "Copy contents of ${src_path} into project?"; then
+                spin "Copying files..." cp -a "${src_path}/." "${proj_dir}/"
+                ok "Copied ${src} into ${proj_dir}"
+            fi
+            ;;
+        "GitHub repo"*)
+            msg "Fetching your repos..."
+            local repos
+            repos="$(gh repo list --limit 100 --json nameWithOwner -q '.[].nameWithOwner' 2>/dev/null)" || true
+            if [[ -z "$repos" ]]; then
+                err "Could not fetch repos. Check: gh auth status"
+                return 1
+            fi
+            local repo
+            repo="$(echo "$repos" | filter "Pick a repo")"
+
+            spin "Cloning ${repo}..." gh repo clone "$repo" "${proj_dir}_clone" -- --depth 1
+            cp -a "${proj_dir}_clone/." "${proj_dir}/" 2>/dev/null || true
+            rm -rf "${proj_dir}_clone"
+            ok "Cloned ${repo}"
+            ;;
+        "Start fresh"*)
+            dim "Empty project created"
+            ;;
+    esac
+
+    # Initialize beads
+    (cd "$proj_dir" && "$BR_BIN" init 2>&1) | tail -3
+    ok "Beads initialized"
+    echo
+    ok "Project '${name}' ready at ${proj_dir}"
+    echo
+
+    if confirm "Start a sprint now?"; then
+        _run_sprint "$name" "$proj_dir"
+    fi
+}
+
+# ============================================================================
+# SPRINT PIPELINE
+# Steps: Optimize Prompt → Generate Plan → Review → Create Beads →
+#        Optimize Parallelism → Validate Against Plan → Sanity Check → Launch
+# ============================================================================
+
+_run_sprint() {
+    local project="$1"
+    local proj_dir="$2"
+
+    # Ensure beads are initialized
+    if [[ ! -d "${proj_dir}/.beads" ]]; then
+        msg "Initializing beads..."
+        (cd "$proj_dir" && "$BR_BIN" init 2>&1) | tail -3
+    fi
+
+    msg "Describe what you want to build."
+    dim "Be as rough or detailed as you want — Claude will refine it."
+    echo
+
+    local description
+    description="$(gum write --header "Feature description" \
+        --placeholder "What should be built? Be specific about behavior, not implementation..." \
+        --char-limit 10000 --width 80 --height 15)"
+
+    if [[ -z "$description" ]]; then
+        err "Description cannot be empty"
+        return 1
+    fi
+
+    local slug
+    slug="$(slugify "$description")"
+    slug="$(input "Sprint slug" --value "$slug" --placeholder "feature-name")"
+
+    local sprint_dir="${proj_dir}/sprints/${slug}"
+    mkdir -p "$sprint_dir"
+    echo "$description" > "${sprint_dir}/description.md"
+    ok "Sprint folder: ${sprint_dir}"
+    echo
+
+    # ── Step 1: Optimize the user's prompt ──
+    step_header "Step 1/9: Optimizing your description"
+
+    claude_ask "$proj_dir" "You are a senior technical product manager. Your job is to take a rough feature description and transform it into a precise, unambiguous specification that AI coding agents can execute perfectly.
+
+Read the codebase in this project to understand the existing architecture, patterns, tech stack, and conventions.
+
+Then take this raw description and produce a refined specification that:
+1. Resolves all ambiguity — make every behavior explicit
+2. References specific files, modules, and patterns from the existing codebase
+3. Defines exact acceptance criteria (what 'done' looks like)
+4. Calls out constraints: what must NOT change, backwards compatibility requirements
+5. Notes the tech stack and conventions to follow (from the codebase)
+6. Identifies edge cases and error handling requirements
+7. Specifies what testing is needed (unit tests only — no server or AI model tests)
+
+Philosophy: It is better to break than to work wrong. No silent failures. No fallbacks that hide bugs. If something fails, it should fail loudly.
+
+Raw description:
+${description}
+
+Output the refined specification as a clean markdown document." || return 1
+
+    claude_result > "${sprint_dir}/spec.md"
+    ok "Specification generated"
+    echo
+
+    # Review spec
+    msg "Review the refined spec. Edit if needed."
+    "${EDITOR:-nano}" "${sprint_dir}/spec.md"
+
+    if ! confirm "Approve this specification?"; then
+        dim "Sprint paused. Edit ${sprint_dir}/spec.md and re-run."
+        return 0
+    fi
+
+    local approved_spec
+    approved_spec="$(cat "${sprint_dir}/spec.md")"
+
+    # ── Step 2: Three expert perspectives (parallel) ──
+    step_header "Step 2/9: Generating 3 expert plans in parallel"
+
+    local plan_base="You have a refined specification and access to the full codebase.
+
+Create a detailed implementation plan with numbered steps. Each step must be:
+- Specific enough that an agent can implement it without asking questions
+- Self-contained with all context needed (file paths, function signatures, behavior)
+- Independent of other steps wherever possible (optimize for parallel execution)
+
+For each step include:
+- A clear one-line title
+- Detailed description of what to implement
+- Exact files to create or modify
+- Dependencies on other steps (by number) — ONLY where truly required
+- Acceptance criteria for this step
+
+Constraints from the spec:
+- No testing that requires a running server or AI model
+- Unit tests and stubbed tests only
+- No silent failures — fail loudly
+- Follow existing codebase conventions
+
+Specification:
+${approved_spec}
+
+Output as markdown with numbered steps."
+
+    # Write prompts to temp files for parallel execution
+    local p1 p2 p3 r1 r2 r3
+    p1="$(mktemp /tmp/flywheel-p1-XXXXXX.txt)"
+    p2="$(mktemp /tmp/flywheel-p2-XXXXXX.txt)"
+    p3="$(mktemp /tmp/flywheel-p3-XXXXXX.txt)"
+    r1="${sprint_dir}/plan_agent1.md"
+    r2="${sprint_dir}/plan_agent2.md"
+    r3="${sprint_dir}/plan_agent3.md"
+
+    printf '%s' "You are Elon Musk — a first-principles thinker. Strip everything to the minimum viable approach. Question every assumption. If a simpler architecture exists, use it. Cut ruthlessly. Every component must justify its existence.
+
+${plan_base}" > "$p1"
+
+    printf '%s' "You are Steve Jobs — obsessed with user experience and simplicity. Think about what the user actually needs, not what's technically interesting. What gets cut matters more than what stays. The best code is no code. Elegance over cleverness.
+
+${plan_base}" > "$p2"
+
+    printf '%s' "You are John Carmack — an engineering craftsman. Think about performance, correctness, and engineering elegance. Consider failure modes, edge cases, and how the system behaves under stress. Prefer explicit over implicit. No magic.
+
+${plan_base}" > "$p3"
+
+    msg "Launching 3 expert agents in parallel..."
+    dim "  Agent 1: First-principles minimalist (Elon)"
+    dim "  Agent 2: UX & simplicity purist (Steve)"
+    dim "  Agent 3: Engineering craftsman (Carmack)"
+    echo
+
+    # Run all 3 in parallel
+    (cd "$proj_dir" && "$CLAUDE_BIN" -p --output-format text "$(cat "$p1")" < /dev/null 2>/dev/null) > "$r1" &
+    local pid1=$!
+    (cd "$proj_dir" && "$CLAUDE_BIN" -p --output-format text "$(cat "$p2")" < /dev/null 2>/dev/null) > "$r2" &
+    local pid2=$!
+    (cd "$proj_dir" && "$CLAUDE_BIN" -p --output-format text "$(cat "$p3")" < /dev/null 2>/dev/null) > "$r3" &
+    local pid3=$!
+
+    # Wait with progress
+    local done_count=0
+    while true; do
+        local still_running=0
+        if kill -0 $pid1 2>/dev/null; then ((still_running++)); else
+            if [[ $done_count -lt 1 ]]; then ok "Agent 1 (Elon) done"; ((done_count++)); fi
+        fi
+        if kill -0 $pid2 2>/dev/null; then ((still_running++)); else
+            if [[ $done_count -lt 2 ]] && ! kill -0 $pid1 2>/dev/null; then ok "Agent 2 (Steve) done"; ((done_count++)); fi
+        fi
+        if kill -0 $pid3 2>/dev/null; then ((still_running++)); else
+            if [[ $done_count -lt 3 ]] && ! kill -0 $pid1 2>/dev/null && ! kill -0 $pid2 2>/dev/null; then ok "Agent 3 (Carmack) done"; ((done_count++)); fi
+        fi
+        [[ $still_running -eq 0 ]] && break
+        sleep 2
+    done
+
+    wait $pid1 $pid2 $pid3 2>/dev/null || true
+    rm -f "$p1" "$p2" "$p3"
+
+    # Validate we got results
+    local plan_count=0
+    [[ -s "$r1" ]] && ((plan_count++))
+    [[ -s "$r2" ]] && ((plan_count++))
+    [[ -s "$r3" ]] && ((plan_count++))
+
+    if [[ $plan_count -eq 0 ]]; then
+        err "All 3 agents failed to produce plans"
+        return 1
+    fi
+
+    ok "Received ${plan_count}/3 expert plans"
+    echo
+
+    # ── Step 3: Merge into unified plan ──
+    step_header "Step 3/9: Synthesizing unified plan"
+
+    claude_ask "$proj_dir" "You are the lead architect. Three expert advisors have each independently created an implementation plan for the same specification. Your job is to synthesize the BEST possible unified plan.
+
+Review all three plans carefully. For each decision point:
+- Take the strongest idea from whichever expert had the best approach
+- Where experts disagree, pick the approach that is simplest AND most correct
+- If one expert identified an edge case or failure mode others missed, include it
+- Eliminate redundancy — the unified plan should be tighter than any individual plan
+
+The philosophy: better to break than work wrong. No silent failures. No fallbacks.
+
+=== EXPERT 1 (First-Principles Minimalist) ===
+$(cat "$r1" 2>/dev/null || echo "[No plan produced]")
+
+=== EXPERT 2 (UX & Simplicity Purist) ===
+$(cat "$r2" 2>/dev/null || echo "[No plan produced]")
+
+=== EXPERT 3 (Engineering Craftsman) ===
+$(cat "$r3" 2>/dev/null || echo "[No plan produced]")
+
+=== SPECIFICATION ===
+${approved_spec}
+
+Output the unified plan as markdown with numbered steps. At the top, include a brief note on which expert perspectives shaped each major decision." || return 1
+
+    claude_result > "${sprint_dir}/plan.md"
+    ok "Unified plan generated"
+    echo
+
+    # Review plan
+    msg "Review the unified plan. Edit if needed."
+    dim "Individual expert plans saved in sprints/${slug}/ for reference."
+    "${EDITOR:-nano}" "${sprint_dir}/plan.md"
+
+    if ! confirm "Approve this plan and create beads?"; then
+        dim "Sprint paused. Edit ${sprint_dir}/plan.md and re-run."
+        return 0
+    fi
+
+    local approved_plan
+    approved_plan="$(cat "${sprint_dir}/plan.md")"
+
+    # ── Step 4: Create detailed beads ──
+    step_header "Step 4/9: Creating beads"
+
+    claude_ask "$proj_dir" "Take the implementation plan below and create a comprehensive set of beads (work items).
+
+Each bead must be TOTALLY SELF-CONTAINED and SELF-DOCUMENTING. An agent picking up this bead should have everything it needs without reading other beads. Include:
+- Relevant background and reasoning
+- Exact files to modify with expected behavior
+- How this serves the overall goal
+- What 'done' looks like
+
+Output ONLY a valid JSON array. No markdown fences. No commentary before or after.
+
+Each element:
+{
+  \"step\": <sequential int>,
+  \"title\": \"<concise one-line title>\",
+  \"description\": \"<detailed self-contained description with all context, files, behavior, acceptance criteria>\",
+  \"priority\": <0=critical, 1=high, 2=normal, 3=low>,
+  \"depends_on\": [<step numbers this blocks on — minimize these>],
+  \"sprint\": \"${slug}\"
+}
+
+Plan:
+${approved_plan}" || return 1
+
+    # Extract JSON from claude result
+    local bead_json
+    bead_json="$(claude_result)"
+    if ! echo "$bead_json" | jq empty 2>/dev/null; then
+        bead_json="$(echo "$bead_json" | sed -n '/^\[/,/^\]/p')"
+        if ! echo "$bead_json" | jq empty 2>/dev/null; then
+            bead_json="$(claude_result | sed -n '/```/,/```/p' | sed '1d;$d')"
+            if ! echo "$bead_json" | jq empty 2>/dev/null; then
+                err "Failed to parse beads JSON"
+                claude_result > "${sprint_dir}/beads_raw.txt"
+                dim "Raw output saved to ${sprint_dir}/beads_raw.txt"
+                return 1
+            fi
+        fi
+    fi
+
+    echo "$bead_json" > "${sprint_dir}/beads.json"
+    local total
+    total="$(echo "$bead_json" | jq length)"
+    ok "Generated ${total} beads"
+    echo
+
+    # ── Step 4: Optimize for parallelism ──
+    step_header "Step 5/9: Optimizing parallelism"
+
+    claude_ask "$proj_dir" "You are a parallelization expert. Review these beads and restructure them to maximize parallel execution.
+
+Rules:
+- Any two beads that CAN run simultaneously MUST run simultaneously
+- Do NOT organize by concept or system area — organize by parallelization potential
+- Minimize dependencies ruthlessly — only add a dependency if the code literally cannot compile or run without the other bead being done first
+- No testing that requires the server running — unit/local/stubbed tests only
+- No testing that requires an AI model
+
+Review each dependency and ask: 'Would the build actually break without this?' If not, remove the dependency.
+
+Current beads:
+$(cat "${sprint_dir}/beads.json")
+
+Output ONLY the optimized JSON array with the same schema. Reorder steps for optimal parallelism. Update depends_on arrays. No commentary." || return 1
+
+    local optimized
+    optimized="$(claude_result)"
+    if echo "$optimized" | jq empty 2>/dev/null; then
+        echo "$optimized" > "${sprint_dir}/beads.json"
+        bead_json="$optimized"
+    elif optimized="$(echo "$optimized" | sed -n '/^\[/,/^\]/p')" && echo "$optimized" | jq empty 2>/dev/null; then
+        echo "$optimized" > "${sprint_dir}/beads.json"
+        bead_json="$optimized"
+    else
+        warn "Could not parse optimized beads, keeping original"
+    fi
+
+    local dep_total
+    dep_total="$(echo "$bead_json" | jq '[.[].depends_on | length] | add // 0')"
+    ok "Optimized: ${total} beads, ${dep_total} total dependencies"
+    echo
+
+    # ── Step 5: Validate beads against plan ──
+    step_header "Step 6/9: Validating beads against plan"
+
+    claude_ask "$proj_dir" "You are a QA architect. Cross-reference every bead against the approved specification and plan.
+
+For each bead, verify:
+1. Does it accomplish what its corresponding plan step requires?
+2. Could it fail silently or produce wrong behavior without raising an error?
+3. Could it sabotage or conflict with any other bead?
+4. Is the description self-contained enough for an agent to implement without context?
+5. Does it follow the project's existing patterns and conventions?
+
+Remember: It is BETTER TO BREAK than to WORK WRONG. We hate fallbacks. If something fails, it must fail loudly.
+
+If you find issues, output an updated JSON array with fixes applied. If everything is solid, output the same JSON array unchanged.
+
+Output ONLY the JSON array. No commentary.
+
+Specification:
+${approved_spec}
+
+Plan:
+${approved_plan}
+
+Beads:
+$(cat "${sprint_dir}/beads.json")" || return 1
+
+    local validation
+    validation="$(claude_result)"
+    if echo "$validation" | jq empty 2>/dev/null; then
+        echo "$validation" > "${sprint_dir}/beads.json"
+        bead_json="$validation"
+    elif validation="$(echo "$validation" | sed -n '/^\[/,/^\]/p')" && echo "$validation" | jq empty 2>/dev/null; then
+        echo "$validation" > "${sprint_dir}/beads.json"
+        bead_json="$validation"
+    else
+        warn "Could not parse validated beads, keeping previous version"
+    fi
+
+    ok "Validation complete"
+    echo
+
+    # ── Step 6: Final sanity check ──
+    step_header "Step 7/9: Final sanity check"
+
+    claude_ask "$proj_dir" "Final review. You are about to hand these beads to a swarm of AI coding agents. This is your last chance to catch problems.
+
+For each bead, ask:
+- Does this make sense? Is it optimal?
+- Could we change anything to make the system work better?
+- Are there missing edge cases?
+- Will the agents have enough context to implement this correctly?
+- Are there any contradictions between beads?
+
+It's much easier to fix things in plan-space than after implementation starts.
+
+If you find improvements, output the updated JSON array. If everything is solid, output the same array.
+
+Output ONLY the JSON array. No commentary.
+
+Beads:
+$(cat "${sprint_dir}/beads.json")" || return 1
+
+    local sanity
+    sanity="$(claude_result)"
+    if echo "$sanity" | jq empty 2>/dev/null; then
+        echo "$sanity" > "${sprint_dir}/beads.json"
+        bead_json="$sanity"
+    elif sanity="$(echo "$sanity" | sed -n '/^\[/,/^\]/p')" && echo "$sanity" | jq empty 2>/dev/null; then
+        echo "$sanity" > "${sprint_dir}/beads.json"
+        bead_json="$sanity"
+    else
+        warn "Could not parse sanity-checked beads, keeping previous version"
+    fi
+
+    total="$(echo "$bead_json" | jq length)"
+    dep_total="$(echo "$bead_json" | jq '[.[].depends_on | length] | add // 0')"
+    ok "Final: ${total} beads, ${dep_total} dependencies"
+    echo
+
+    # ── Step 7: Create beads in br ──
+    step_header "Step 8/9: Creating beads in tracker"
+
+    declare -A BEAD_MAP
+    local created=0 failed=0
+
+    while IFS= read -r row; do
+        local step title desc pri bead_id
+        step="$(echo "$row" | jq -r '.step')"
+        title="$(echo "$row" | jq -r '.title')"
+        desc="$(echo "$row" | jq -r '.description')"
+        pri="$(echo "$row" | jq -r '.priority')"
+
+        # br create outputs: "✓ Created <id>: <title>"
+        local create_out
+        create_out="$(cd "$proj_dir" && "$BR_BIN" create "$title" \
+            -t task -p "$pri" -d "$desc" 2>&1)" || true
+
+        # Extract bead ID — format is "<prefix>-<alphanumeric>"
+        bead_id="$(echo "$create_out" | grep -oP '(?<=Created )\S+(?=:)' | head -1)" || true
+
+        if [[ -n "$bead_id" ]]; then
+            BEAD_MAP[$step]="$bead_id"
+            dim "  ${bead_id}: ${title}"
+            ((created++)) || true
+        else
+            err "  Step ${step}: ${title}"
+            ((failed++)) || true
+        fi
+    done < <(echo "$bead_json" | jq -c '.[]')
+
+    # Wire dependencies
+    local dep_count=0
+    while IFS= read -r row; do
+        local step
+        step="$(echo "$row" | jq -r '.step')"
+        local deps
+        deps="$(echo "$row" | jq -r '.depends_on[]' 2>/dev/null)" || true
+        for dep_step in $deps; do
+            local dep_id="${BEAD_MAP[$dep_step]:-}"
+            local this_id="${BEAD_MAP[$step]:-}"
+            if [[ -n "$dep_id" && -n "$this_id" ]]; then
+                (cd "$proj_dir" && "$BR_BIN" dep add "$this_id" "blocks:${dep_id}" 2>/dev/null) || true
+                ((dep_count++)) || true
+            fi
+        done
+    done < <(echo "$bead_json" | jq -c '.[]')
+
+    echo
+    if [[ $failed -gt 0 ]]; then
+        warn "Created ${created} beads, ${failed} failed, ${dep_count} dependencies"
+    else
+        ok "Created ${created} beads with ${dep_count} dependencies"
+    fi
+    echo
+
+    # Show final status
+    (cd "$proj_dir" && "$BR_BIN" stats 2>/dev/null) || true
+    echo
+    ok "Sprint '${slug}' ready"
+    echo
+
+    if confirm "Launch swarm now?"; then
+        _run_swarm "$project" "$proj_dir"
+    fi
+}
+
+mode_start_sprint() {
+    msg "Start a new sprint"
+    echo
+
+    local project
+    project="$(pick_project)" || return 1
+    local proj_dir="${PROJECTS_BASE}/${project}"
+
+    _run_sprint "$project" "$proj_dir"
+}
+
+# ============================================================================
+# SWARM LAUNCH
+# ============================================================================
+
+_run_swarm() {
+    local project="$1"
+    local proj_dir="$2"
+
+    # Show bead status
+    echo
+    (cd "$proj_dir" && "$BR_BIN" stats 2>/dev/null) || dim "No bead stats available"
+    echo
+
+    local ready_count
+    ready_count="$(cd "$proj_dir" && "$BR_BIN" ready --json 2>/dev/null | jq length 2>/dev/null)" || ready_count=2
+
+    local default_agents=$ready_count
+    [[ $default_agents -gt 16 ]] && default_agents=16
+    [[ $default_agents -lt 1 ]] && default_agents=2
+
+    local agent_count
+    agent_count="$(input "Claude agents to spawn" --value "$default_agents" --placeholder "1-16")"
+    agent_count="${agent_count:-$default_agents}"
+
+    if ! [[ "$agent_count" =~ ^[0-9]+$ ]] || [[ "$agent_count" -lt 1 ]] || [[ "$agent_count" -gt 16 ]]; then
+        err "Agent count must be 1-16"
+        return 1
+    fi
+
+    echo
+    msg "Spawning ${agent_count} Claude agents for '${project}'"
+    dim "Stagger: 120s between agents"
+    echo
+
+    if ! confirm "Launch swarm?"; then
+        dim "Cancelled."
+        return 0
+    fi
+
+    local spawn_prompt='Read AGENTS.md. Then loop: run `br ready --json` to find the highest-priority unblocked bead, check mail to see if its locked, then if its unlocked, LOCK IT, then claim it with `br update <id> --status=in_progress`, implement it, close it with `br close <id>`, run `br sync --flush-only`, commit, and repeat.'
+
+    "$NTM_BIN" spawn "$project" \
+        --cc="$agent_count" \
+        --stagger-mode=fixed \
+        --stagger-delay=120s \
+        --prompt="$spawn_prompt"
+
+    echo
+    ok "Swarm launched!"
+    dim "Attach:    ntm attach ${project}"
+    dim "Dashboard: ntm dashboard"
+    dim "Logs:      ntm logs ${project}"
+}
+
+mode_launch_swarm() {
+    msg "Launch a coding swarm"
+    echo
+
+    local project
+    project="$(pick_project)" || return 1
+    local proj_dir="${PROJECTS_BASE}/${project}"
+
+    _run_swarm "$project" "$proj_dir"
+}
+
+# ============================================================================
+# STATUS
+# ============================================================================
+
+mode_status() {
+    msg "Project status"
+    echo
+
+    local view
+    view="$(choose "What to view" \
+        "Bead stats" \
+        "Active sessions" \
+        "Dashboard")"
+
+    case "$view" in
+        "Bead stats")
+            local project
+            project="$(pick_project)" || return 1
+            local proj_dir="${PROJECTS_BASE}/${project}"
+            echo
+            (cd "$proj_dir" && "$BR_BIN" stats 2>/dev/null) || true
+            echo
+            msg "Ready beads:"
+            (cd "$proj_dir" && "$BR_BIN" ready 2>/dev/null) || dim "None"
+            ;;
+        "Active sessions")
+            "$NTM_BIN" list 2>/dev/null || dim "No active sessions"
+            ;;
+        "Dashboard")
+            "$NTM_BIN" dashboard 2>/dev/null || dim "No dashboard available"
+            ;;
+    esac
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+main() {
+    check_deps
+    get_projects_base
+
+    case "${1:-}" in
+        new)     banner; mode_new_project ;;
+        sprint)  banner; mode_start_sprint ;;
+        swarm)   banner; mode_launch_swarm ;;
+        status)  banner; mode_status ;;
+        version) echo "flywheel v${FLYWHEEL_VERSION}" ;;
+        help|-h|--help)
+            echo "flywheel v${FLYWHEEL_VERSION} — Swarm Coding Wizard"
+            echo
+            echo "Usage: flywheel [command]"
+            echo
+            echo "Commands:"
+            echo "  new      Create a new project"
+            echo "  sprint   Plan a feature and create beads"
+            echo "  swarm    Launch agents on a project"
+            echo "  status   View project and session status"
+            echo "  help     Show this help"
+            echo
+            echo "Run without arguments for interactive menu."
+            ;;
+        "")
+            banner
+            while true; do
+                local mode
+                mode="$(choose "What do you want to do?" \
+                    "New Project" \
+                    "Start Sprint" \
+                    "Launch Swarm" \
+                    "Status" \
+                    "Quit")"
+                echo
+                case "$mode" in
+                    "New Project")   mode_new_project ;;
+                    "Start Sprint")  mode_start_sprint ;;
+                    "Launch Swarm")  mode_launch_swarm ;;
+                    "Status")        mode_status ;;
+                    "Quit")          exit 0 ;;
+                esac
+                echo
+            done
+            ;;
+        *)
+            err "Unknown command: $1"
+            echo "Run: flywheel help"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

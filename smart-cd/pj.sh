@@ -72,7 +72,6 @@ pj - quickly cd into projects
 Usage:
   pj                     cd to /data/projects
   pj <name>              cd to /data/projects/<name> (or its alias)
-  pj:<name>              same, via command_not_found handler
 
 Alias management:
   pj alias <name> <path> create an alias (relative paths resolve under /data/projects)
@@ -99,39 +98,27 @@ EOF
   esac
 }
 
-# Handle pj:project syntax via command_not_found handler
+# Tab completion: project dirs + aliases + subcommands
 if [ -n "$ZSH_VERSION" ]; then
-  _pj_original_cnf_handler=$(typeset -f command_not_found_handler 2>/dev/null)
-
-  command_not_found_handler() {
-    local cmd="$1"
-    shift
-    if [[ "$cmd" == pj:* ]]; then
-      local project="${cmd#pj:}"
-      pj "$project"
-    elif [ -n "$_pj_original_cnf_handler" ]; then
-      eval "$_pj_original_cnf_handler"
-      command_not_found_handler "$cmd" "$@"
-    else
-      echo "zsh: command not found: $cmd" >&2
-      return 127
+  _pj_complete() {
+    local -a projects aliases subcmds
+    subcmds=(alias unalias aliases help)
+    projects=(${$(command ls -1 "$_PJ_BASE" 2>/dev/null)})
+    if [ -s "$_PJ_ALIASES_FILE" ]; then
+      aliases=(${$(cut -d= -f1 "$_PJ_ALIASES_FILE" 2>/dev/null)})
     fi
+    _describe 'command' subcmds -- projects -- aliases
   }
+  compdef _pj_complete pj
 elif [ -n "$BASH_VERSION" ]; then
-  _pj_original_cnf_handle=$(typeset -f command_not_found_handle 2>/dev/null)
-
-  command_not_found_handle() {
-    local cmd="$1"
-    shift
-    if [[ "$cmd" == pj:* ]]; then
-      local project="${cmd#pj:}"
-      pj "$project"
-    elif [ -n "$_pj_original_cnf_handle" ]; then
-      eval "$_pj_original_cnf_handle"
-      command_not_found_handle "$cmd" "$@"
-    else
-      echo "bash: $cmd: command not found" >&2
-      return 127
+  _pj_complete_bash() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local words="alias unalias aliases help"
+    words+=" $(command ls -1 "$_PJ_BASE" 2>/dev/null)"
+    if [ -s "$_PJ_ALIASES_FILE" ]; then
+      words+=" $(cut -d= -f1 "$_PJ_ALIASES_FILE" 2>/dev/null)"
     fi
+    COMPREPLY=($(compgen -W "$words" -- "$cur"))
   }
+  complete -F _pj_complete_bash pj
 fi
